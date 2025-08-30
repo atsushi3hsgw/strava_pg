@@ -29,7 +29,7 @@ $env:STRAVA_TOKEN_EXPIRES_AT=xxxxxxxxxx
 ```
 ## save your activity data to the database
 ```powershell
-python.exe .\store_activities.py
+python.exe .\store_activities.py --limit 10 --after 2025-01-01 --before 2025-08-31
 ```
 
 ## search database activity data
@@ -51,5 +51,7 @@ psql -U postgres -d strava -f sample_activities.sql
 ## launch the application
 ```powershell
 streamlit run .\view_segment_efforts.py
+
+Start-Process streamlit -ArgumentList "run", ".\view_segment_efforts.py"
 ```
 ![sample](sample_image.png)

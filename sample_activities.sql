@@ -1,4 +1,5 @@
 SELECT
+    data->>'id' AS id,
     data->>'start_date' AS start_date,
     data->>'name' AS name,
     (data->>'distance')::numeric AS distance_m,
@@ -7,4 +8,4 @@ SELECT
     (data->>'average_heartrate')::numeric AS avg_hr,
     (data->>'max_heartrate')::numeric AS max_hr
 FROM activities
-ORDER BY id DESC;
+ORDER BY start_date DESC;
