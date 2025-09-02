@@ -1,4 +1,4 @@
-### How to Run the Updated App
+### How to Run the App
 1.  Prepare your Strava API application.  
     To use the Strava API, you will need to obtain an API key and other credentials from Strava.  
 
@@ -24,3 +24,6 @@
 4.  Run the Streamlit app.
     ```bash
     streamlit run strava_segment_efforts.py
+    ```
+![sample_screen_shot](sample_screen_shot.png)
+

@@ -1,4 +1,6 @@
+import polyline
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from datetime import datetime, time, timezone, timedelta
 import time as time_module
@@ -7,17 +9,30 @@ from sqlalchemy import create_engine, text
 from stravalib.client import Client
 from stravalib.exc import RateLimitExceeded
 import logging
+import folium
+from folium.plugins import HeatMap
+from streamlit_folium import st_folium
+import tempfile
 
-# Set up logging
-log_level_str = os.getenv("STRAVA_LOG_LEVEL", "INFO").upper()
-log_level = getattr(logging, log_level_str, logging.INFO)
-logging.basicConfig(level=log_level)
-# Get a logger for this module
-logger = logging.getLogger(__name__)
+def setup_logger(name=__name__):
+    logger = logging.getLogger(name)
+    if not logger.hasHandlers():
+        level_str = os.getenv("STRAVA_LOG_LEVEL", "INFO").upper()
+        level = getattr(logging, level_str, logging.INFO)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '[%(asctime)s] %(levelname)s in %(name)s: %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(level)
+    return logger
+
+logger = setup_logger(__name__)
 
 # Page configuration
 st.set_page_config(
-    page_title="STRAVA Segment Efforts Dashboard",
+    page_title="My Segment Efforts Dashboard",
     page_icon="🚴",
     layout="wide"
 )
@@ -185,7 +200,7 @@ def get_segments():
 def get_segment_data(segment_id):
     """Get data for a specific segment."""
     engine = get_db_engine()
-    query = f"""
+    query = text("""
     SELECT
         (data->>'start_date_local')::timestamp AS start_time,
         effort->>'name' AS effort_name,
@@ -198,15 +213,194 @@ def get_segment_data(segment_id):
         (effort->'segment'->>'distance')::numeric / (effort->>'elapsed_time')::numeric * 3.6 AS avg_speed_kmh
     FROM activities,
          jsonb_array_elements(data->'segment_efforts') AS effort
-    WHERE (effort->'segment'->>'id')::bigint = {segment_id}
+    WHERE (effort->'segment'->>'id')::bigint = :segment_id
     ORDER BY start_time DESC
-    """
-    df = pd.read_sql(query, engine)
+    """)
+    with engine.connect() as connection:
+        df = pd.read_sql(query, connection, params={"segment_id": int(segment_id)})
     return df
 
+@st.cache_data(ttl=300)
+def get_polylines(before=None, after=None):
+    """
+    Get all decoded polylines for heatmap as [[lat, lng], ...].
+    
+    Parameters
+    ----------
+    before : datetime | None
+        Include activities with start_time <= before
+    after : datetime | None
+        Include activities with start_time >= after
+    """
+    logger.debug(f"get_polylines before={before}, after={after} ")
+    engine = get_db_engine()
+
+    base_query = """
+    SELECT 
+        data->'map'->>'polyline' AS polyline,
+        (data->>'start_date_local')::timestamp AS start_time
+    FROM
+        activities
+    WHERE 
+        data->'map'->>'polyline' IS NOT NULL
+    """
+
+    conditions = []
+    bind_params = {}
+    if before is not None:
+        conditions.append("(data->>'start_date_local')::timestamp <= :before")
+        bind_params["before"] = before
+    if after is not None:
+        conditions.append("(data->>'start_date_local')::timestamp >= :after")
+        bind_params["after"] = after
+
+    if conditions:
+        base_query += " AND " + " AND ".join(conditions)
+
+    allcoords = []
+    with engine.connect() as conn:
+        result = conn.execute(text(base_query), bind_params)
+        for row in result:
+            poly = row[0]
+            if not poly or not isinstance(poly, str):
+                continue
+            try:
+                coords = polyline.decode(poly)
+                allcoords.extend(coords)
+            except Exception as e:
+                st.warning(f"Failed to decode a polyline: {e}")
+                logger.warning(f"Failed to decode polyline: {e}")
+                continue
+
+    return allcoords
+
+def segment_efforts_dashboard():
+    
+    # Get segment list from the database
+    try:
+        segments_df = get_segments()
+    except Exception as e:
+        st.error(f"Error fetching segment data. Please ensure the database is running: {e}")
+        return
+        
+    if segments_df.empty:
+        st.warning("No segment data found in the database. Please download activities from the sidebar.")
+        return
+        
+    # Select segment
+    selected_segment_name = st.selectbox(
+        "Select a segment to analyze:",
+        segments_df['segment_name'],
+        index=0
+    )
+    
+    
+    selected_segment = segments_df[segments_df['segment_name'] == selected_segment_name].iloc[0]
+    
+    # Get segment data
+    segment_data = get_segment_data(selected_segment['segment_id'])
+    
+    if segment_data.empty:
+        st.warning("No data found for the selected segment.")
+        return
+        
+    st.subheader(f"{selected_segment_name}")
+    
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    
+    with col1:
+        st.metric("Fastest Time", format_time(segment_data['elapsed_time_sec'].min()))
+    with col2:
+        st.metric("Average Time", format_time(segment_data['elapsed_time_sec'].mean()))
+    with col3:
+        st.metric("Average Heart Rate", f"{segment_data['avg_heartrate'].mean():.1f} bpm")
+    with col4:
+        st.metric("Average Speed", f"{segment_data['avg_speed_kmh'].mean():.1f} km/h")
+    with col5:
+        st.metric("Average Cadence", f"{segment_data['avg_cadence'].mean():.1f} rpm")
+    with col6:
+        st.metric("Total Efforts", f"{len(segment_data)}")
+    
+    # Charts    
+    st.subheader("Charts")   
+    chart_data = segment_data.sort_values('start_time')
+
+    charts_to_display = {
+        "elapsed_time_sec": "Elapsed Time (seconds)",
+        "avg_cadence": "Average Cadence (RPM)",
+        "avg_speed_kmh": "Average Speed (km/h)",
+        "avg_heartrate": "Average Heart Rate (bpm)",
+    }
+
+    for y_axis, title in charts_to_display.items():
+        st.subheader(title)
+        chart_df = pd.DataFrame({
+            "start_time": chart_data['start_time'],
+            y_axis: chart_data[y_axis]
+        })
+        st.line_chart(chart_df, x="start_time", y=y_axis)
+    
+    # Statistics
+    st.subheader("Detailed Statistics")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("#### All Performance Data")
+        st.dataframe(segment_data[['start_time', 'elapsed_time_sec', 'avg_heartrate', 'avg_cadence', 'avg_speed_kmh']].set_index('start_time').sort_index(ascending=False))
+    
+    with col2:
+        st.write("#### Monthly Statistics")
+        segment_data['year_month'] = segment_data['start_time'].dt.to_period('M')
+        monthly_stats = segment_data.groupby('year_month').agg({
+            'elapsed_time_sec': ['count', 'mean', 'min'],
+            'avg_heartrate': 'mean',
+            'avg_cadence': 'mean',
+            'avg_speed_kmh': 'mean'
+        }).round(1)
+        st.dataframe(monthly_stats)
+
+@st.cache_data(ttl=3600)
+def generate_heatmap_html(coords):
+
+    if not coords:
+        return None
+
+    center_lat = sum(p[0] for p in coords) / len(coords)
+    center_lon = sum(p[1] for p in coords) / len(coords)
+
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
+    HeatMap(coords, radius=8, blur=5, min_opacity=0.2).add_to(m)
+    
+    return m._repr_html_()
+
+def heatmap_dashboard(before=None, after=None):
+    
+    logger.debug(f"heatmap_dashboard before={before}, after={after} ")
+    
+    st.subheader("Personal Heatmap")
+    st.info(f"Fetching coordinates...")
+    coords = get_polylines(before=before, after=after)
+    st.info(f"Fetched {len(coords)} coordinates.")
+                    
+    if coords:
+        # center_lat = sum(p[0] for p in coords) / len(coords)
+        # center_lon = sum(p[1] for p in coords) / len(coords)
+    
+        # m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
+        # HeatMap(coords, radius=8, blur=5, min_opacity=0.2).add_to(m)
+        # st_folium(m, use_container_width=True)
+        map_html = generate_heatmap_html(coords)
+        if map_html:
+            components.html(map_html, height=500)
+    else:
+        st.warning("No coordinates to display for the selected date range.")
+        
+    if st.button("Segment Efforts Dashboard"):
+        st.session_state['dashboard'] = 'segment_efforts'
+        st.rerun()
+    
 # Main application
 def main():
-    st.title("STRAVA Segment Efforts Dashboard")
+    st.title("My Dashboard")
 
     # Authentication flow
     authenticate_strava()
@@ -218,8 +412,8 @@ def main():
         # Activity download UI
         with st.sidebar.expander("🚴‍♀️ Download Activities"):
             st.info("Fetch new data and update the database.")
-            before_date = st.date_input("End Date (Before)", None)
-            after_date = st.date_input("Start Date (After)", datetime.now().date() - timedelta(days=10))
+            before_date = st.date_input("End Date (Before)", None, key="download_before")
+            after_date = st.date_input("Start Date (After)", datetime.now().date() - timedelta(days=10), key="download_after")
             limit = st.number_input("Number of Activities", min_value=1, value=10, step=1)
             
             if st.button("Execute Download"):
@@ -235,85 +429,29 @@ def main():
                         limit=limit
                     )
         
-       
-        # Get segment list from the database
-        try:
-            segments_df = get_segments()
-        except Exception as e:
-            st.error(f"Error fetching segment data. Please ensure the database is running: {e}")
-            return
-            
-        if segments_df.empty:
-            st.warning("No segment data found in the database. Please download activities from the sidebar.")
-            return
-            
-        # Select segment
-        selected_segment_name = st.selectbox(
-            "Select a segment to analyze:",
-            segments_df['segment_name'],
-            index=0
-        )
-        
-        segment_id = segments_df[segments_df['segment_name'] == selected_segment_name]['segment_id'].iloc[0]
-        
-        # Get segment data
-        segment_data = get_segment_data(segment_id)
-        
-        if segment_data.empty:
-            st.warning("No data found for the selected segment.")
-            return
-            
-        # Main display
-        st.subheader(f"Performance for {selected_segment_name}")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Fastest Time", format_time(segment_data['elapsed_time_sec'].min()))
-        with col2:
-            st.metric("Average Time", format_time(segment_data['elapsed_time_sec'].mean()))
-        with col3:
-            st.metric("Average Heart Rate", f"{segment_data['avg_heartrate'].mean():.1f} bpm")
-        with col4:
-            st.metric("Average Speed", f"{segment_data['avg_speed_kmh'].mean():.1f} km/h")
-        
-        # Charts
-        st.subheader("Charts")   
-        chart_data = segment_data.sort_values('start_time')
-        
-        st.subheader("Elapsed Time Progression")
-        time_chart_data = pd.DataFrame({
-            "start_time": chart_data['start_time'],
-            "elapsed_time_sec": chart_data['elapsed_time_sec']
-        })
-        
-        st.line_chart(time_chart_data, x="start_time", y="elapsed_time_sec")
-        
-        st.subheader("Average Cadence Progression")
-        cadence_chart_data = pd.DataFrame({
-            "start_time": chart_data['start_time'],
-            "avg_cadence": chart_data['avg_cadence']
-        })
-        st.line_chart(cadence_chart_data, x="start_time", y="avg_cadence")
-        
-        # Statistics
-        st.subheader("Detailed Statistics")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("#### All Performance Data")
-            st.dataframe(segment_data[['start_time', 'elapsed_time_sec', 'avg_heartrate', 'avg_cadence', 'avg_speed_kmh']].set_index('start_time').sort_index(ascending=False))
-        
-        with col2:
-            st.write("#### Monthly Statistics")
-            segment_data['year_month'] = segment_data['start_time'].dt.to_period('M')
-            monthly_stats = segment_data.groupby('year_month').agg({
-                'elapsed_time_sec': ['count', 'mean', 'min'],
-                'avg_heartrate': 'mean',
-                'avg_cadence': 'mean',
-                'avg_speed_kmh': 'mean'
-            }).round(1)
-            st.dataframe(monthly_stats)
+        # Personal Heatmap UI
+        with st.sidebar.expander("🗺️ Personal Heatmap"):
+            st.info("Create a personal heatmap from your activities.")
+            heatmap_before_date = st.date_input("End Date (Before)", None, key="heatmap_before")
+            heatmap_after_date = st.date_input("Start Date (After)", None, key="heatmap_after")
 
+            if st.button("Create Heatmap"):
+                if heatmap_after_date and heatmap_before_date and heatmap_after_date > heatmap_before_date:
+                    st.warning("Start date must be before the end date.")
+                else:
+                    st.session_state['dashboard'] = 'heatmap'
+                    st.rerun()
+
+        if st.session_state.get('dashboard') == 'heatmap':
+            local_tz = datetime.now().astimezone().tzinfo
+            heatmap_before_date = st.session_state.get('heatmap_before', None)
+            heatmap_after_date = st.session_state.get('heatmap_after', None)
+            heatmap_before_datetime_lc = datetime.combine(heatmap_before_date, time.min, tzinfo=local_tz) if heatmap_before_date else None
+            heatmap_after_datetime_lc  = datetime.combine(heatmap_after_date, time.min, tzinfo=local_tz) if heatmap_after_date else None
+            heatmap_dashboard(before=heatmap_before_datetime_lc, after=heatmap_after_datetime_lc)
+        else:
+            segment_efforts_dashboard()
+        
 # Start the application
 if __name__ == "__main__":
     main()
