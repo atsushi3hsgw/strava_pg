@@ -1,0 +1,13 @@
+[Unit]
+Description=Streamlit App Service
+After=network.target postgresql.service
+
+[Service]
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/strava_pg
+ExecStart=/home/ec2-user/strava_pg/aws/start_strava_segment_efforts.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
