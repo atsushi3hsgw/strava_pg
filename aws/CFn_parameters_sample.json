@@ -1,0 +1,18 @@
+[
+  {
+    "ParameterKey": "StravaClientId",
+    "ParameterValue": "YOUR_STRAVA_CLIENT_ID"
+  },
+  {
+    "ParameterKey": "StravaClientSecret",
+    "ParameterValue": "YOUR_STRAVA_CLIENT_SECRET"
+  },
+  {
+    "ParameterKey": "DbUser",
+    "ParameterValue": "strava_user"
+  },
+  {
+    "ParameterKey": "DbPassword",
+    "ParameterValue": "strava_user_password"
+  }
+]

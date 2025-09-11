@@ -1,7 +1,15 @@
 #!/bin/bash
 set -e
 
-source .venv/bin/activate
+# Enable the virtual environment
+export PYENV_ROOT="$HOME/.pyenv"
+export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init -)"
+eval "$(pyenv virtualenv-init -)"
+
+# Force application of the project's pyenv virtual environment
+# (Unnecessary if .python-version exists)
+pyenv activate strava-pg-env
 
 # Configure AWS Region (Tokyo Region)
 export AWS_REGION="ap-northeast-1"

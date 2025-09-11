@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Strava Streamlit App deployment with custom scripts and SSM parameters.
+
+Parameters:
+  StravaClientId:
+    Type: String
+    Description: Strava API Client ID.
+  StravaClientSecret:
+    Type: String
+    NoEcho: true
+    Description: Strava API Client Secret.
+  DbUser:
+    Type: String
+    Description: PostgreSQL database user name.
+  DbPassword:
+    Type: String
+    NoEcho: true
+    Description: PostgreSQL database password.
+  InstanceType:
+    Type: String
+    Default: 't3.micro'
+  KeyPairName:
+    Type: String
+    Default: strava-stack
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+
+Resources:
+  # ------------------------------------------------------------#
+  #  SSM Parameters
+  # ------------------------------------------------------------#
+  SSMClientId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /streamlit-app/strava/client_id
+      Type: String
+      Value: !Ref StravaClientId
+  SSMClientSecret:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /streamlit-app/strava/client_secret
+      Type: String
+      Value: !Ref StravaClientSecret
+  SSMDbUser:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /streamlit-app/strava/db_user
+      Type: String
+      Value: !Ref DbUser
+  SSMDbPassword:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /streamlit-app/strava/db_passwd
+      Type: String
+      Value: !Ref DbPassword
+  SSMRedirectUri:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /streamlit-app/strava/redirect_uri
+      Type: String
+      Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+
+  # ------------------------------------------------------------#
+  #  Network (VPC, Subnets, IGW, NAT GW, Routes)
+  # ------------------------------------------------------------#
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-IGW
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-PublicSubnet-1
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet-2
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-PrivateSubnet-1
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Public-RT
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  AssociatePublicRT1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  AssociatePublicRT2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-NAT-GW
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Private-RT
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  AssociatePrivateRT1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ------------------------------------------------------------#
+  #  Security & IAM
+  # ------------------------------------------------------------#
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-ALB-SG
+      GroupDescription: Security group for ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress: [{CidrIp: 0.0.0.0/0, IpProtocol: tcp, FromPort: 80, ToPort: 80}]
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-EC2-SG
+      GroupDescription: Security group for EC2 instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress: [{SourceSecurityGroupId: !Ref ALBSecurityGroup, IpProtocol: tcp, FromPort: 8501, ToPort: 8501}]
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2InstanceRole]
+
+  # ------------------------------------------------------------#
+  #  EC2 Instance & UserData
+  # ------------------------------------------------------------#
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+      SubnetId: !Ref PrivateSubnet1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds: [!Ref EC2SecurityGroup]
+      KeyName: !Ref KeyPairName
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-EC2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          exec > >(tee /var/log/cfn-user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+          echo "# 1. Install PostgreSQL, Git"
+          dnf update -y
+          dnf install -y git postgresql15-server postgresql-devel
+
+          echo "# 2. Initialize and start PostgreSQL"
+          postgresql-setup --initdb
+          systemctl enable postgresql
+          systemctl start postgresql
+          PG_HBA_CONF="/var/lib/pgsql/data/pg_hba.conf"
+          sed -i 's/\(host\s\+all\s\+all\s\+.*\s\+\)ident/\1md5/' "$PG_HBA_CONF"
+          systemctl restart postgresql
+          sudo -u postgres psql -c "CREATE USER ${DbUser} WITH PASSWORD '${DbPassword}';"
+          sudo -u postgres psql -c "CREATE DATABASE strava OWNER ${DbUser};"
+
+  # ------------------------------------------------------------#
+  #  Load Balancer
+  # ------------------------------------------------------------#
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${AWS::StackName}-ALB
+      Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      SecurityGroups: [!Ref ALBSecurityGroup]
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-TG
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 8501
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      TargetType: instance
+      Targets: [{Id: !Ref EC2Instance}]
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref ALBTargetGroup}]
+
+Outputs:
+  ALBDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
