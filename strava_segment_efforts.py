@@ -13,6 +13,9 @@ import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 import tempfile
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def setup_logger(name=__name__):
     logger = logging.getLogger(name)
